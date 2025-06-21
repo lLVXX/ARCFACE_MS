@@ -1,70 +1,97 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+import psycopg2
 import numpy as np
-import cv2
-import insightface
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from insightface.app import FaceAnalysis
+from io import BytesIO
+from PIL import Image
+from collections import defaultdict
+
+# CONFIG
+PG_HOST = "localhost"
+PG_PORT = 5432
+PG_USER = "postgres"
+PG_PASSWORD = "12345678"
+PG_DB = "SCOUT_DB"
+
+PG_QUERY = """
+    SELECT estudiante_id, embedding
+    FROM personas_estudiantefoto
+    WHERE embedding IS NOT NULL
+"""
+
+THRESHOLD = 0.5  # <--- Ajusta aquí (0.5 recomendado, prueba 0.55 si necesitas más precisión)
 
 app = FastAPI()
-
-# Habilita CORS para permitir peticiones desde tu frontend (Django, React, etc)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Cambia por ["http://localhost:8000"] si solo usas Django local
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+face_app = FaceAnalysis(providers=['CPUExecutionProvider'])
+face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-model = None
-
-def cargar_modelo():
-    global model
-    if model is None:
-        model = insightface.app.FaceAnalysis(name="buffalo_l", providers=['CPUExecutionProvider'])
-        model.prepare(ctx_id=0, det_size=(640, 640))
-    return model
-
-@app.post("/generar_embedding/")
-async def generar_embedding_api(file: UploadFile = File(...)):
-    # Recibe una imagen y retorna el embedding
-    contents = await file.read()
-    arr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return JSONResponse({"error": "No se pudo decodificar la imagen."}, status_code=400)
-    model = cargar_modelo()
-    faces = model.get(img)
-    if not faces:
-        return JSONResponse({"error": "No se detectó rostro."}, status_code=400)
-    embedding = faces[0]['embedding'].tolist()
-    return {"embedding": embedding}
+def get_multi_embeddings_from_db():
+    conn = psycopg2.connect(
+        dbname=PG_DB,
+        user=PG_USER,
+        password=PG_PASSWORD,
+        host=PG_HOST,
+        port=PG_PORT,
+    )
+    cur = conn.cursor()
+    cur.execute(PG_QUERY)
+    data = cur.fetchall()
+    cur.close()
+    conn.close()
+    embeddings_dict = defaultdict(list)
+    for est_id, emb_bin in data:
+        emb = np.frombuffer(emb_bin, dtype=np.float32)
+        embeddings_dict[est_id].append(emb)
+    return embeddings_dict
 
 @app.post("/match_faces/")
-async def match_faces_api(
-    file: UploadFile = File(...),
-    embeddings: str = Form(...)
-):
-    # embeddings debe ser una lista de listas JSON (embeddings de estudiantes)
-    import json
-    contents = await file.read()
-    arr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return JSONResponse({"error": "No se pudo decodificar la imagen."}, status_code=400)
-    model = cargar_modelo()
-    faces = model.get(img)
+async def match_faces(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    np_img = np.array(img)
+    faces = face_app.get(np_img)
     if not faces:
-        return JSONResponse({"error": "No se detectó rostro."}, status_code=400)
-    embedding_input = faces[0]['embedding']
-    try:
-        embeddings_list = json.loads(embeddings)
-    except Exception as e:
-        return JSONResponse({"error": f"Embeddings JSON inválido: {str(e)}"}, status_code=400)
-    # Matching con todos los embeddings (ArcFace: coseno > 0.5 ~ match)
-    resultados = []
-    for idx, emb in enumerate(embeddings_list):
-        emb = np.array(emb, dtype=np.float32)
-        sim = np.dot(emb, embedding_input) / (np.linalg.norm(emb) * np.linalg.norm(embedding_input))
-        resultados.append({"idx": idx, "similarity": float(sim)})
-    return {"resultados": resultados}
+        return {"ok": False, "msg": "No se detectaron rostros"}
+
+    # --- Matching Multi-Embedding ---
+    embeddings_dict = get_multi_embeddings_from_db()
+    results = []
+    for face in faces:
+        query_emb = face.embedding
+        best_score = -1
+        best_est_id = None
+
+        for est_id, emb_list in embeddings_dict.items():
+            # Max similarity among all embeddings of this estudiante
+            max_sim = max(
+                np.dot(query_emb, emb) / (np.linalg.norm(query_emb) * np.linalg.norm(emb) + 1e-8)
+                for emb in emb_list
+            )
+            if max_sim > best_score:
+                best_score = max_sim
+                best_est_id = est_id
+
+        results.append({
+            "face_box": face.bbox.tolist(),
+            "estudiante_id": int(best_est_id) if best_score > THRESHOLD else None,
+            "similarity": float(best_score),
+            "match": bool(best_score > THRESHOLD)
+        })
+
+    return {
+        "ok": True,
+        "num_faces": len(faces),
+        "results": results,
+    }
+
+@app.get("/")
+def healthcheck():
+    return {"status": "ok"}
