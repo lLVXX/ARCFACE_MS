@@ -20,7 +20,7 @@ PG_QUERY = """
     WHERE embedding IS NOT NULL
 """
 
-THRESHOLD = 0.5  # <--- Ajusta aquí (0.5 recomendado, prueba 0.55 si necesitas más precisión)
+THRESHOLD = 0.5  # <--- Ajusta aquí (0.5 recomendado)
 
 app = FastAPI()
 app.add_middleware(
@@ -91,6 +91,22 @@ async def match_faces(file: UploadFile = File(...)):
         "num_faces": len(faces),
         "results": results,
     }
+
+
+
+@app.post("/generar_embedding/")
+async def generar_embedding(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    np_img = np.array(img)
+    faces = face_app.get(np_img)
+    if not faces:
+        return {"ok": False, "msg": "No se detectaron rostros"}
+    # Retorna solo el embedding del rostro más grande (o el primero)
+    embedding = faces[0].embedding.tolist()
+    return {"ok": True, "embedding": embedding}
+
+
 
 @app.get("/")
 def healthcheck():
